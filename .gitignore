@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Generated database (rebuild with `npm run seed`)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Environment and secrets
+.env
+.env.*
+
+# Logs and test output
+*.log
+coverage/
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
