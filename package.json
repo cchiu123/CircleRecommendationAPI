@@ -1,0 +1,32 @@
+{
+  "name": "circle-recommendation-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Recommends Lean In Circles for a member, with a short explanation for each.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "seed": "tsx src/db/seed.ts",
+    "start": "tsx src/server.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "review": "tsx scripts/review.ts",
+    "sensitivity": "tsx scripts/sensitivity.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "fastify": "^5.12.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.7"
+  },
+  "overrides": {
+    "light-my-request": "6.6.0"
+  }
+}
