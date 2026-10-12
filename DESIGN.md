@@ -24,10 +24,12 @@ Circle activity and capacity are the same for every member, so they are computed
 
 ## For production scale
 
-- Move to Postgres with migrations. Replace the one-time seed with a bulk backfill, then apply the platform's change events as upserts and update only the affected Circle's stats.
+- Authenticate callers and take the member from her token, so she can only request her own list. Add rate limiting.
+- Move to Postgres with replicas and migrations. Replace the one-time seed with a bulk backfill, then apply the platform's change events as upserts and update only the affected Circle's stats.
 - Split candidate generation from ranking, precompute co-membership counts, and cache each member's list until she joins a Circle or edits her interests.
 - Log impressions, joins and later participation, then learn the weights. The target is members who stay and take part, not joins alone.
 - Add embeddings for softer topic matching and near-duplicate detection, and watch exposure so new and small Circles are not starved.
+- Fall back to the list of active Circles if personalization fails or times out, and return reason codes so clients can localize the explanations.
 
 ## With more time
 
