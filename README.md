@@ -130,6 +130,153 @@ Indexing decisions:
 - `posts (circle_id, created_at)` supports per-Circle engagement over a time window.
 - Topics and tags are normalized into join tables so interest matching is an indexed join, not string matching on arrays.
 - `circle_stats` is precomputed because Circle health is the same for every member.
+- `CHECK` constraints restrict `format`, `access`, `join_policy` and `role` to their allowed values.
+- `max_members` is nullable: null means uncapped.
+
+## Code walkthrough
+
+The source is 12 files in [src/](src/). This section follows the order a request flows through them.
+
+```
+src/
+  server.ts              HTTP layer: one route plus a health check
+  db/
+    schema.sql           Tables and indexes
+    connection.ts        Opens the SQLite database
+    seed.ts              Loads the JSON files and computes Circle health
+  recommend/
+    index.ts             The pipeline: gathers facts, then calls the steps below
+    filter.ts            Step 1: which Circles are eligible
+    score.ts             Step 2: weighted score per Circle
+    diversify.ts         Step 3: limit repeats of one topic
+    explain.ts           Step 4: member-facing sentences
+    health.ts            Circle capacity and activity score
+    bio.ts               Topic hints from a member's bio
+    types.ts             Shared data shapes
+```
+
+### What happens on a request
+
+`GET /users/7/recommendations?limit=5`
+
+1. `server.ts` validates `id` and `limit`, then calls `recommend(db, 7, 5)`.
+2. `index.ts` looks up the user, her interests, her memberships, her bio and her location.
+3. `filter.ts` returns every Circle she could join.
+4. `index.ts` attaches to each Circle the facts that link it to her: topic match, tag matches, bio match, shared members, and whether it is remotely joinable.
+5. `score.ts` turns those facts into a score, keeping each signal's contribution separately.
+6. `diversify.ts` picks the top Circles, discounting a second Circle on the same topic.
+7. `explain.ts` turns the largest contributions into sentences.
+8. `index.ts` shapes the response and `server.ts` returns it as JSON.
+
+Circle health, which steps 3 and 5 rely on, is not computed during a request. It is computed once, when the database is seeded.
+
+### Database layer: [src/db/](src/db/)
+
+**[connection.ts](src/db/connection.ts)**: `openDb(path)` opens a SQLite file and turns on foreign keys. Tests pass `":memory:"` to get a throwaway database.
+
+**[seed.ts](src/db/seed.ts)**: `seed(db, dataDir)` reads the five JSON files and fills every table in one transaction.
+
+- **Topic names are converted to topic ids.** The JSON files refer to topics by a text name such as `getting-promoted` (called a slug in the data). The seed looks up each name and stores its numeric id. A name that is not in the topics table stops the seed with an error, so a typo in the data is caught immediately.
+- **Tags that repeat the primary topic are skipped**, since the primary row already covers them.
+- **The snapshot date is derived**: `asOf` is the latest `last_activity_at` across all Circles. Recency is measured against that, not today's date.
+- **Engagement is gathered per Circle** from posts in the 30 days before `asOf`.
+- **`computeCircleStats`** from `health.ts` is called for each Circle and the result is stored in `circle_stats`.
+
+Run with `npm run seed`, it deletes any existing database file, reseeds, and prints row counts.
+
+### Recommender: [src/recommend/](src/recommend/)
+
+**[types.ts](src/recommend/types.ts)**: the shapes passed between steps.
+
+| Type | Meaning |
+|---|---|
+| `Candidate` | An eligible Circle plus the facts linking it to one member |
+| `ScoreParts` | The seven contributions that add up to a score |
+| `ScoredCandidate` | A `Candidate` with its `score` and `parts` |
+| `Reason` | A `code` and the sentence shown to the member |
+| `ReasonCode` | The eight possible reason codes |
+| `Recommendation` | One item in the API response |
+
+**[index.ts](src/recommend/index.ts)**: `recommend(db, userId, limit)` is the entry point. It returns `null` for an unknown user.
+
+It works out three things about the member:
+
+- **`inferredTopics`**: topics from her bio, read only if she has stated no interests.
+- **`isColdStart`**: true when she has no interests, no memberships and no usable bio.
+- **`needsRemoteOption`**: true when her location is missing or "Remote".
+
+It runs two SQL queries for the per-member facts:
+
+- **Topic matches**: joins `user_topics` to `circle_topics`, and sorts the results into primary matches and tag matches.
+- **Shared members**: a three-way self-join on `memberships`. It goes from her Circles, to the other people in them, to every Circle those people belong to, and counts distinct people per Circle.
+
+Then it builds the `Candidate` list, runs score, diversify and explain, and rounds the score to three decimals.
+
+**[filter.ts](src/recommend/filter.ts)**: `eligibleCircles(db, userId)` is one SQL query. It keeps a Circle only when it is not full, not inactive, public, and she has no membership row for it. These are filters, not penalties: a removed Circle is never scored.
+
+**[health.ts](src/recommend/health.ts)**: `computeCircleStats(circle, recentPostEngagement, asOf)` is a pure function used by the seed step.
+
+| Output | Rule |
+|---|---|
+| `seats_left` | `max_members - member_count`, or null when uncapped |
+| `is_full` | `seats_left` is exactly 0 |
+| `is_inactive` | No posts in 30 days and more than 60 days since any activity |
+| `activity_score` | A 0–1 blend of the four parts below |
+
+| Part | Share | Scaling |
+|---|---|---|
+| Posts in 30 days | 35% | Linear, capped at 12 |
+| Recency | 30% | 1 today, falling to 0 at 30 days |
+| Chat messages in 30 days | 20% | Logarithmic, capped at 150 |
+| Average engagement per recent post | 15% | Linear, capped at 15 |
+
+The caps sit near the level of a typical active Circle in the seed data, so the score separates quiet from lively and stops rewarding volume beyond that.
+
+**[bio.ts](src/recommend/bio.ts)**: `inferTopicsFromBio(bio)` checks a bio against 11 patterns, each mapped to a topic, and returns the topics that match. For example, "career break" or "returning to work" maps to career breaks. It matches "leadership" but not "leaders", so a bio about mentoring women leaders is not read as an interest in leadership skills.
+
+**[score.ts](src/recommend/score.ts)**: `scoreCandidate(c)` computes each contribution from the weights table above and their sum.
+
+- The shared-members part is 0.5 × (shared members ÷ Circle size). Dividing by size keeps large Circles from winning only because they contain more people.
+- A Circle matching on both topic and tag is counted once.
+- `byRank` is the sort order: higher score first, then higher activity score, then lower Circle id. Ties come out the same on every run.
+
+**[diversify.ts](src/recommend/diversify.ts)**: `diversify(scored, limit)` builds the final list one pick at a time.
+
+- Each round, it takes the best remaining Circle.
+- A Circle whose topic has already been picked once has its score multiplied by `REPEAT_TOPIC_PENALTY` (0.7).
+- A Circle whose topic has been picked `MAX_PER_TOPIC` (2) times is skipped.
+- Circles with no topic are never treated as repeats of each other.
+
+The score in the API response is the adjusted one, which is why the list is always in descending order.
+
+**[explain.ts](src/recommend/explain.ts)**: `explain(c, isColdStart)` returns the list of reasons for one Circle. For a cold start, it returns the "most active Circles right now" sentence, plus the format sentence when it applies. Otherwise:
+
+1. Each signal that is present becomes a candidate reason, tagged with its contribution to the score.
+2. The candidates are sorted by contribution and the top two are kept.
+3. If nothing qualified, it falls back to a plain activity fact.
+4. "Only N spots left." is appended when a capped Circle has two or fewer seats.
+
+Shared members is mentioned only at 2 or more people, and a Circle is called "active" only with an activity score of 0.5 or more.
+
+### HTTP layer: [server.ts](src/server.ts)
+
+`buildApp(db)` creates the Fastify app with the two routes. A JSON schema validates `id` and `limit`, so Fastify returns 400 for anything malformed; a `null` from `recommend` becomes a 404.
+
+Run with `npm start`, it checks that the database file exists, opens it read-only, and listens on `127.0.0.1`. Keeping `buildApp` separate from the startup code lets the tests call routes without opening a port.
+
+### Where to change things
+
+| To change | Edit |
+|---|---|
+| A scoring weight | `WEIGHTS` in `score.ts` |
+| The activity blend or inactivity cutoff | `ACTIVITY_WEIGHTS`, `INACTIVE_AFTER_DAYS` in `health.ts`, then reseed |
+| Which Circles are excluded | The `WHERE` clause in `filter.ts` |
+| How many Circles per topic, or the discount | `MAX_PER_TOPIC`, `REPEAT_TOPIC_PENALTY` in `diversify.ts` |
+| Explanation wording or thresholds | `explain.ts` |
+| Bio keywords | `BIO_TOPIC_HINTS` in `bio.ts` |
+| Default or maximum list length | `DEFAULT_LIMIT`, `MAX_LIMIT` in `index.ts` |
+
+After any change, run `npm test` and `npm run sensitivity`.
 
 ## Tests
 
